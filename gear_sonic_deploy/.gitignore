@@ -5,3 +5,7 @@ build/
 target/
 logs/
 *.trt
+reference/
+src/
+renders/renders/
+gear_sonic_deploy/renders/

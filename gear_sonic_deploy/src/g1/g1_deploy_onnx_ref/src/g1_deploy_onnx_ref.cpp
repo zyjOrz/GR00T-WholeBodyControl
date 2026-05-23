@@ -137,6 +137,9 @@
 #include "../include/error_monitor.hpp"
 
 #include "audio_thread/audio_thread.hpp"
+#include <cstdlib>
+#include <string>
+#include <sstream>
 
 // DDS
 using namespace unitree::common;
@@ -3125,6 +3128,147 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      // ---------------------------------------------------------------------
+      // DexterousGPT D7 physical motor-target replay from CSV.
+      //
+      // Runtime:
+      //   export DGPT_MOTOR_TARGET_CSV=/path/to/motor_targets.csv
+      //   export DGPT_MOTOR_TARGET_INDICES=15,16,17,18,19,20,21,22,23,24,25,26,27,28
+      //
+      // CSV columns:
+      //   q_0..q_28,dq_0..dq_28,kp_0..kp_28,kd_0..kd_28,tau_0..tau_28
+      //
+      // All targets are in MuJoCo / hardware order and absolute q_target.
+      // ---------------------------------------------------------------------
+      const char* dgpt_motor_csv_env = std::getenv("DGPT_MOTOR_TARGET_CSV");
+      if (dgpt_motor_csv_env != nullptr && std::string(dgpt_motor_csv_env).size() > 0) {
+        struct DgptTargetRow {
+          std::array<float, 29> q;
+          std::array<float, 29> dq;
+          std::array<float, 29> kp;
+          std::array<float, 29> kd;
+          std::array<float, 29> tau;
+        };
+
+        static bool dgpt_loaded = false;
+        static std::string dgpt_loaded_path;
+        static std::vector<DgptTargetRow> dgpt_rows;
+        static std::vector<int> dgpt_indices;
+
+        auto parse_indices = []() {
+          std::vector<int> out;
+          const char* env = std::getenv("DGPT_MOTOR_TARGET_INDICES");
+          std::string s = env ? std::string(env) : std::string("15,16,17,18,19,20,21,22,23,24,25,26,27,28");
+          std::stringstream ss(s);
+          std::string item;
+          while (std::getline(ss, item, ',')) {
+            try {
+              int v = std::stoi(item);
+              if (v >= 0 && v < G1_NUM_MOTOR) out.push_back(v);
+            } catch (...) {}
+          }
+          return out;
+        };
+
+        auto load_csv = [&](const std::string& path) {
+          dgpt_rows.clear();
+          dgpt_indices = parse_indices();
+
+          std::ifstream fin(path);
+          if (!fin.is_open()) {
+            std::cerr << "[DGPT D7] ERROR cannot open motor target csv: " << path << std::endl;
+            return false;
+          }
+
+          std::string line;
+          std::getline(fin, line);  // header
+
+          while (std::getline(fin, line)) {
+            if (line.empty()) continue;
+
+            std::vector<float> vals;
+            std::stringstream ss(line);
+            std::string cell;
+            while (std::getline(ss, cell, ',')) {
+              try {
+                vals.push_back(std::stof(cell));
+              } catch (...) {
+                vals.push_back(0.0f);
+              }
+            }
+
+            if (vals.size() < 29 * 5) {
+              continue;
+            }
+
+            DgptTargetRow row;
+            for (int i = 0; i < 29; ++i) {
+              row.q[i] = vals[i];
+              row.dq[i] = vals[29 + i];
+              row.kp[i] = vals[58 + i];
+              row.kd[i] = vals[87 + i];
+              row.tau[i] = vals[116 + i];
+            }
+            dgpt_rows.push_back(row);
+          }
+
+          std::cout << "[DGPT D7] loaded motor target csv: " << path
+                    << " rows=" << dgpt_rows.size()
+                    << " override_indices=";
+          for (int idx : dgpt_indices) std::cout << idx << ",";
+          std::cout << std::endl;
+
+          return !dgpt_rows.empty();
+        };
+
+        std::string dgpt_path(dgpt_motor_csv_env);
+        if (!dgpt_loaded || dgpt_loaded_path != dgpt_path) {
+          dgpt_loaded = load_csv(dgpt_path);
+          dgpt_loaded_path = dgpt_path;
+        }
+
+        if (dgpt_loaded && !dgpt_rows.empty()) {
+          int frame_copy = 0;
+          std::string motion_name_copy = "";
+
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            frame_copy = current_frame_;
+            if (current_motion_) motion_name_copy = current_motion_->name;
+          }
+
+          if (frame_copy < 0) frame_copy = 0;
+          if (frame_copy >= static_cast<int>(dgpt_rows.size())) {
+            frame_copy = static_cast<int>(dgpt_rows.size()) - 1;
+          }
+
+          const auto& row = dgpt_rows[frame_copy];
+
+          for (int i : dgpt_indices) {
+            motor_command_tmp.q_target.at(i) = row.q[i];
+            motor_command_tmp.dq_target.at(i) = row.dq[i];
+            motor_command_tmp.tau_ff.at(i) = row.tau[i];
+
+            if (row.kp[i] > 0.0f) motor_command_tmp.kp.at(i) = row.kp[i];
+            if (row.kd[i] > 0.0f) motor_command_tmp.kd.at(i) = row.kd[i];
+          }
+
+          static int dgpt_log_counter = 0;
+          if ((dgpt_log_counter++ % 250) == 0) {
+            std::cout << "[DGPT D7 MotorCSV]"
+                      << " frame=" << frame_copy
+                      << " q15=" << row.q[15]
+                      << " q18=" << row.q[18]
+                      << " q19=" << row.q[19]
+                      << " q22=" << row.q[22]
+                      << " q25=" << row.q[25]
+                      << " q26=" << row.q[26]
+                      << " motion=" << motion_name_copy
+                      << std::endl;
+          }
+        }
+      }
+
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
     }

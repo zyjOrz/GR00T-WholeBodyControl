@@ -1,0 +1,14 @@
+set shell := ["bash", "-lc"]
+
+build:
+    mkdir -p build
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SRCS=ON
+    cmake --build build --config Release -j$(nproc)
+
+run binary *args:
+    ./target/release/{{binary}} {{args}}
+
+list:
+    @echo "Available recipes:"
+    @echo "  just build"
+    @echo "  just run <binary> <args...>"
